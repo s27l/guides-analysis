@@ -1,0 +1,640 @@
+---
+title: "Walkthrough guides analysis"
+date: "July 20th 2018"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+### 
+
+Presented below is an analysis of walkthrough guides. 
+This document summarizes the guides analysis so far in https://docs.google.com/document/d/17NBbp5bq3NbxsemQVWa19DyI2aksfaeA1rECalguksg/edit#
+
+###
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(root.dir = "/Users/sukmanilamba/Downloads")
+knitr::opts_chunk$set(echo = TRUE)
+# Required libraries
+library(dplyr)
+library(lubridate)
+library(anytime)
+library(tidyr)
+library(reshape2)
+library(leaps)
+library(caret)
+library(rpart)
+library(data.table)
+library(boot)
+library(ggplot2)
+library(ggthemes)
+library(plotly)
+library(shiny)
+
+```
+
+```{r,echo=FALSE}
+
+setwd("/Users/sukmanilamba/Downloads")
+dfN <- read.csv("GuideEvents_Combined.csv")
+GL <- read.csv("updated_guides_list.csv")
+dfN1 <- merge(dfN,GL,by=c('guideId','guideStepId'))
+dfNU <- dfN1
+dfNU <- subset(dfNU,!(is.na(dfNU$numSteps)))
+factor_not <- c("guideType","type","guideId","visitorId","accountId","state")
+dfNU[,factor_not] <- sapply(dfNU[,factor_not],as.character)
+dfNU <- subset(dfNU,state == 'public')
+dfNU <- subset(dfNU,dfNU$numSteps >= 2) # Guides with more than 1 step
+dfNU$browserTime <- as.numeric(dfNU$browserTime)/1000 #to seconds
+dfNU$browserTime <- as.POSIXct((dfNU$browserTime),origin="1970-01-01") #to date time stamp
+numrows <- length(unique(dfNU$guideId))
+### Setting up dataframes to collect in all the relevant results
+
+numcols <- max(dfNU$numSteps) + 5 # This is because the first two columns have the guide id and total number of visitors
+numvis <- length(unique(dfNU$visitorId))
+#numcolvis <- max(dfNU$numSteps)+5 # WHY DID YOU CREATE THIS?
+
+NBuckets <- as.data.frame(matrix(0.0,numrows,numcols)) # guide level
+NVBuckets <- as.data.frame(matrix(0.0,numvis,numcols)) # Visitor level
+NCBuckets <- as.data.frame(matrix(0.0,numrows,numcols)) # guide level
+colnames(NBuckets) <- c("All_Guides","All_Visitors","Num_Steps","Segment","Completed")
+colnames(NCBuckets) <- c("All_Guides","All_Visitors","Num_Steps","Segment")
+colnames(NVBuckets) <- c("Guide","Visitor","Num_Steps","Segment","Completed")
+
+guidelist <- unique(dfNU$guideId)
+
+NBuckets$All_Guides <- guidelist
+NCBuckets$All_Guides <- guidelist
+
+NVBuckets$Visitor <- unique(dfNU$visitorId)
+```
+
+```{r,echo=FALSE}
+# Initializing the analysis with the dataframes
+for (i in 1:numrows) # For all of the guides
+{
+  r1 = NBuckets$All_Guides[i];
+  dfr1 = subset(dfNU,guideId == r1)
+  NBuckets$All_Visitors[i] = length(unique(dfr1$visitorId))
+  NBuckets$Num_Steps[i] = dfr1$numSteps[1]
+  NBuckets$Segment[i] = dfr1$segmentId[1]
+  
+  NCBuckets$All_Visitors[i] = length(unique(dfr1$visitorId))
+  NCBuckets$Num_Steps[i] = dfr1$numSteps[1]
+  NCBuckets$Segment[i] = dfr1$segmentId[1]
+  
+}
+
+
+# Extracting the number of users who completed every step for each guide
+
+for (i in 1:numrows)
+{
+  
+  r1 = NBuckets$All_Guides[i]
+  dfr1 = subset(dfNU,guideId == r1)
+  nsteps = NBuckets$Num_Steps[i]
+  nstepval = nsteps - 1
+  
+  sdfrf = subset(dfr1,stepIndex == nstepval) # The final step of the walkthrough
+  sdfrf = subset(sdfrf,type == 'guideSeen')
+  
+  FC = dim(sdfrf)[1]
+  if (FC > 0)
+  {
+    NBuckets$Completed[i]  = length(unique(sdfrf$visitorId));
+    # This vector tells us whether any visitors of this guide actually completed it,
+    # as this is the set of those who went through the final step of the walkthrough.
+  }
+  
+  
+  for (j in 1:nsteps)
+  {
+    val = j-1
+    sdfr1 = subset(dfr1,stepIndex == val)
+    sdfr1 = subset(sdfr1,type == 'guideSeen')
+    
+    int_ln = length(unique(intersect(sdfr1$visitorId,sdfrf$visitorId)))
+    NCBuckets[i,j+5] = int_ln;
+    # What's the number of visitors who finished at this stage?
+    dim1 = dim(sdfr1)
+    if (dim1[1] > 0)
+    {
+      NBuckets[i,j+5] = length(unique(sdfr1$visitorId)) # The number of users who finished this step
+    }
+  }
+}
+
+NBuckets$Perc_Completed <- 100.0*(NBuckets$Completed/NBuckets$All_Visitors)
+
+# Logic per visitor
+
+visitorlist <- unique(dfNU$visitorId)
+dfNU_GV <- dfNU[,c("guideId","visitorId")]
+dfNU_GV <- dfNU_GV[!duplicated(dfNU_GV),]
+numr <- dim(dfNU_GV)[1]
+dfNU_GVSC <- as.data.frame(matrix(0,dim(dfNU_GV)[1],dim(dfNU_GV)[2]+8))
+NVisitor <- as.data.frame(matrix(0,numr,numcols))
+
+colnames(dfNU_GVSC) <- c("Guide","Visitor","Segment","Num_Steps","Completed","FirstStep","CompletedButOne", "StartTime","EndTime","Duration")
+
+
+dfNU_GVSC$Guide <- dfNU_GV$guideId
+dfNU_GVSC$Visitor <- dfNU_GV$visitorId
+
+colnames(NVisitor) <- c("Visitor","Guide","Num_Steps","Segment","Completed")
+
+factor_not <- c("guideId","visitorId")
+dfNU_GV[,factor_not] <- sapply(dfNU_GV[,factor_not],as.character)
+
+factor_not <- c("Guide","Visitor")
+dfNU_GVSC[,factor_not] <- sapply(dfNU_GVSC[,factor_not],as.character)
+
+numr <- dim(dfNU_GVSC)[1]
+
+# For each visitor guide combination
+for (i in 1:numr)
+{
+  
+  
+  v1 = dfNU_GVSC$Visitor[i]
+  g1 = dfNU_GVSC$Guide[i]
+  
+  dfr1 = subset(dfNU,((visitorId == v1) & (guideId == g1)))
+  dfNU_GVSC$Segment[i] = dfr1$segmentId[1]
+  nsteps = dfr1$numSteps[1]
+  nstepval = nsteps - 1
+  dfNU_GVSC$Num_Steps[i] = nsteps
+  dfr1$type <- as.character(dfr1$type)
+  dfr1 = subset(dfr1,type == 'guideSeen') # We are after all only interested in the guideSeen events.
+  # Future permutations should we want them
+  #dfr1 = subset(dfr1,type != 'guideDismissed')
+  #dfr_1 <- subset(dfr1,((stepIndex == 0) & (type == 'guideSeen')))
+  #dfr_1 <- subset(dfr1,stepIndex == 0)
+  dfr_1 <- subset(dfr1,stepIndex == 0)
+  F0 = dim(dfr_1)[1]
+  
+  dfr7 <- dfr1[!is.na(dfr1$browserTime),]
+  dfr10 = subset(dfr7,stepIndex == nstepval)
+  FC3 = dim(dfr7)[1]
+  FC10 = dim(dfr10)[1]
+  
+  FC10
+  
+  if (FC3 > 0) #Logic to read max and min time
+  {
+  dfNU_GVSC$StartTime[i] = min(dfr1$browserTime);
+  }
+  
+  if(FC10 > 0)
+  {
+  dfNU_GVSC$EndTime[i] = min(dfr10$browserTime);
+  }
+  
+  
+  if (F0 > 0) # That this is a non-empty set or that we have complete data for this data set
+  {
+    dfNU_GVSC$FirstStep[i] = 1
+  }
+  # sdfrf = subset(dfr1,((stepIndex == nstepval) & (type == 'guideSeen')))
+  penum_step = nstepval-1
+  sdfrf = subset(dfr1,stepIndex == penum_step)
+  sdfrf2 = subset(dfr1,stepIndex == nstepval)
+  
+  FC = dim(sdfrf)[1]
+  FC2 = dim(sdfrf2)[1]
+  if (FC > 0)
+  {
+    dfNU_GVSC$CompletedButOne[i]  = 1; 
+    # This vector tells us whether this visitor completed the last but one step of this guide.
+  }
+  
+  if (FC2 > 0)
+  {
+    dfNU_GVSC$Completed[i]  = 1; 
+    # This vector tells us whether this visitor completed this guide.
+  }
+}
+
+  dfNU_GVSC$StartTime <- as.POSIXct(as.numeric(as.character(dfNU_GVSC$StartTime)),origin="1970-01-01")
+  dfNU_GVSC$EndTime <- as.POSIXct(as.numeric(as.character(dfNU_GVSC$EndTime)),origin="1970-01-01")
+  dfNU_GVSC$Duration <- (as.numeric(dfNU_GVSC$EndTime)- as.numeric(dfNU_GVSC$StartTime))/60
+  
+# Percentage matrix
+# All of this code is just for assigning the different elements
+
+NPercBuckets <- as.data.frame(matrix(0,numrows,numcols))
+colnames(NPercBuckets) <- c("All_Guides","All_Visitors","Num_Steps", "Segment", "Step1", "Step2","Step3","Step4","Step5","Step6","Step7","Step8","Step9","Step10", "Step11","Step12","Step13","Step14","Step15","Step16","Step17","Step18","Step19","Step20", "Step21","Step22")
+
+NPercCBuckets <- as.data.frame(matrix(0,numrows,numcols))
+colnames(NPercCBuckets) <- c("All_Guides","All_Visitors","Num_Steps", "Segment","Step1", "Step2","Step3","Step4","Step5","Step6","Step7","Step8","Step9","Step10", "Step11","Step12","Step13","Step14","Step15","Step16","Step17","Step18","Step19","Step20", "Step21", "Step22")
+
+NPercBuckets$All_Guides <- as.character(NBuckets$All_Guides)
+NPercBuckets$All_Visitors <- NBuckets$All_Visitors
+NPercBuckets$Num_Steps <- NBuckets$Num_Steps
+NPercBuckets$Segment <- NBuckets$Segment
+
+
+NPercCBuckets$All_Guides <- as.character(NBuckets$All_Guides)
+NPercCBuckets$All_Visitors <- NBuckets$All_Visitors
+NPercCBuckets$Num_Steps <- NBuckets$Num_Steps
+NPercCBuckets$Segment <- NBuckets$Segment
+NPercCBuckets$Num_Steps <- NBuckets$Num_Steps
+
+dfNU$guideId <- as.character(dfNU$guideId)
+
+# This is the percentage of people who complete each step for this particular guide (all its visitors)
+for (i in 1:numrows)
+{
+  
+  nsteps = NPercBuckets$Num_Steps[i]
+  ns5 = nsteps+4
+  
+  NPercBuckets[i,5:ns5] <- 100*(NBuckets[i,5:ns5]/NBuckets$All_Visitors[i])
+}
+
+
+# This is the percentage of people who finish based on the buckets of those who complete each step
+
+for (i in 1:numrows)
+{
+  
+  nsteps = NPercCBuckets$Num_Steps[i]
+  ns5 = nsteps+4
+  NPercCBuckets[i,5:ns5] <- 100*(NCBuckets[i,5:ns5+1]/NBuckets[i,5:ns5+1])
+}
+```
+
+
+
+
+```{r, echo=FALSE}
+###### REPORTING OF PERCENTAGES #########
+# Buildling dataframes for reporting
+
+### This code can be made smarter
+NPercBuckets_2 <- subset(NPercBuckets,Num_Steps == 2)
+NPercBuckets_3 <- subset(NPercBuckets,Num_Steps == 3)
+NPercBuckets_4 <- subset(NPercBuckets,Num_Steps == 4)
+NPercBuckets_5 <- subset(NPercBuckets,Num_Steps == 5)
+NPercBuckets_6 <- subset(NPercBuckets, Num_Steps == 6)
+NPercBuckets_7 <- subset(NPercBuckets, Num_Steps == 7)
+
+NPercCBuckets_2 <- subset(NPercCBuckets,Num_Steps == 2)
+NPercCBuckets_3 <- subset(NPercCBuckets,Num_Steps == 3)
+NPercCBuckets_4 <- subset(NPercCBuckets,Num_Steps == 4)
+NPercCBuckets_5 <- subset(NPercCBuckets,Num_Steps == 5)
+NPercCBuckets_6 <- subset(NPercCBuckets, Num_Steps == 6)
+NPercCBuckets_7 <- subset(NPercCBuckets, Num_Steps == 7)
+### End of comment about smart code
+NBuckets$Perc_Completed <- 100.0*(NBuckets$Completed/NBuckets$All_Visitors)
+
+idx_noseg <- which(is.na(NBuckets$Segment))
+idx_seg <-  which(!is.na(NBuckets$Segment))
+
+write.csv(dfNU,"dfNU.csv")
+write.csv(NBuckets,"NBuckets.csv")
+write.csv(NCBuckets,"NCBuckets.csv")
+write.csv(NPercBuckets,"NPercBuckets.csv")
+write.csv(NVBuckets,"NVBuckets.csv")
+write.csv(dfNU_GVSC,"dfNU_GVSC.csv")
+write.csv(NPercBuckets,"NPercCBuckets.csv")
+```
+
+```{r,echo=FALSE}
+
+#get subset of the data set where numsteps = i
+#and then sum up  
+
+```
+
+
+```{r,echo=FALSE}
+#Summarizing percentage completion at each step length
+
+ResAll <- NBuckets[,c("All_Guides","Num_Steps","Perc_Completed")] %>% group_by(Num_Steps) %>% summarize(total_guides = length(All_Guides), perc_completion = mean(Perc_Completed))
+ResAll$perc_guides <- 100*ResAll$total_guides/sum(ResAll$total_guides)
+
+#Looking at timings only for instances of completion
+ResAll1 <- subset(dfNU_GVSC,Completed == '1') 
+ResAll1 <- ResAll1[,c("Guide","Visitor","Num_Steps","Duration")] %>% group_by(Num_Steps) %>% summarize(avg_completion = mean(Duration))
+
+dfNU_GVSC
+
+```
+
+Total guides:
+```{r,echo=FALSE}
+dim(NBuckets)[1]
+```
+
+Average, max and min guide length:
+```{r,echo=FALSE}
+mean(NBuckets$Num_Steps)
+max(NBuckets$Num_Steps)
+min(NBuckets$Num_Steps)
+```
+
+Visitors:
+Total visitors:
+```{r,echo=FALSE}
+dim(dfNU_GVSC)[1] #includes duplicate visitors across our guides
+```
+Average, median, min and max number of visitors per guide:
+```{r,echo=FALSE}
+round(mean(NBuckets$All_Visitors), digits=0)
+round(median(NBuckets$All_Visitors), digits=0)
+max(NBuckets$All_Visitors)
+min(NBuckets$All_Visitors)
+```
+Unique visitors:
+```{r,echo=FALSE}
+length(unique(dfNU_GVSC$Visitor))
+```
+
+Average, min and max guide length:
+```{r,echo=FALSE}
+round(mean(NBuckets$Num_Steps), digits=0)
+max(NBuckets$Num_Steps)
+min(NBuckets$Num_Steps)
+```
+
+Based on guideSteps created:
+% Tooltip guidesteps:
+```{r,echo=FALSE}
+dfsteptype <- dfNU[!duplicated(dfNU$guideStepId),]
+tooltip = subset(dfsteptype,stepType == 'tooltip')
+  100*dim(tooltip)[1]/dim(dfsteptype)[1]
+```
+% Lightbox guidesteps:
+```{r,echo=FALSE}
+lightbox = subset(dfsteptype,stepType == 'lightbox')
+  100*dim(lightbox)[1]/dim(dfsteptype)[1]
+```
+% Banner guidesteps:
+```{r,echo=FALSE}
+banner = subset(dfsteptype,stepType == 'banner')
+  100*dim(banner)[1]/dim(dfsteptype)[1]
+```
+
+```{r,echo=FALSE}
+Guidetypes <- as.data.frame(matrix(0.0,3,3))
+factor_not <- c("tooltip","lightbox","banner")
+```
+
+
+
+```{r,echo=FALSE}
+#Distribution of guides by guide length
+#
+
+p2 <- ggplot(ResAll,aes(x = Num_Steps , y = total_guides)) 
+  p2 + geom_bar(stat = "identity", fill = "#FF4876") +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+    ggtitle("Distribution of guides by guide length")+
+    labs(x="Guide length (steps)", y= "Totals")+
+    theme_hc()+
+    theme(plot.background = element_rect(fill = "#F6FDFC"))
+##barchart(Num_Steps ~ total_guides, data = ResAll, main="Counts of guides by length",ylab="Guide Length",xlab="Counts", col= "##0A817F", border= "white")
+```
+
+ 
+
+```{r,echo=FALSE}
+#Plot of percentage completion at each step length (with size of visitors)
+
+GL1 <- GL[!duplicated(GL$guideId),]
+NBuckets1 <- merge(NBuckets, GL1, by.x=c('All_Guides'), by.y=c('guideId'), all.x = TRUE) 
+
+mean(NBuckets1$Perc_Completed)
+sum(NBuckets1$All_Visitors)
+
+NBuckets1
+write.csv(NBuckets1,"NBuckets1.csv")
+```
+
+```{r,echo=FALSE}
+
+library(plotly)
+library(ggrepel)
+p1 <- ggplot(NBuckets1 ,aes(x = Num_Steps , y = Perc_Completed, , label = paste(name,"[",All_Visitors,"]")))
+  p1 + geom_point(aes (size = All_Visitors), colour = "#FF4876") +
+    geom_smooth(method= "lm", se = FALSE, colour = "#0A817F") +
+    ggtitle("Plot of percentage completion at each step length (trendline)")+
+    labs(x="Guide length (steps)", y= "% visitors completed")+
+    theme_hc()+
+    theme(legend.position="none")+
+    theme(plot.background = element_rect(fill = "#F6FDFC"))+
+    geom_label_repel(size = 2)
+ # p4 <- ggplotly(p1, tooltip = c("text"))
+
+```
+
+No. of guides completed, no. of visitors who completed guides:
+```{r,echo=FALSE}
+dim(NBuckets[which(NBuckets$Completed!=0),])[1]
+sum(NBuckets$Completed) #Metrics for guide length vs average completion time graph -  guides (that were completed by atleast one visitor) and total visitors that completed guides (could have repeats across guides)
+```
+
+
+
+```{r,echo=FALSE}
+#Plot of average completion time at each step length
+#library(tidyverse) 
+#ResAll1 %>%
+   #filter(!is.na(Num_Steps)) %>%
+  
+ggplot(ResAll1,aes(x = Num_Steps, Hours, y = avg_completion))+
+    geom_line(stat = 'identity',color = "#FF4876")+
+    geom_smooth(method = "lm", se = FALSE, colour= "#0A817F")+
+    labs(x="Guide length (steps)", y= "Average completion time")+
+    ggtitle("Plot of average completion time at each step length")+
+    theme_hc()+
+    theme(legend.position="none")+
+    theme(plot.background = element_rect(fill = "#F6FDFC"))
+```
+
+
+
+Average % of repeat views, repeat visitors per guide:
+```{r,echo=FALSE}
+#Average %repeatviews and %repeatvisitors by guide length
+#dfNU$guideId_visitorId<- paste(dfNU$guideId,dfNU$visitorId)
+
+dfNU$guideStepId_visitorId<- paste(dfNU$guideStepId,dfNU$visitorId)
+totalsbyguide <- dfNU[,c("guideId", "numSteps", "guideStepId_visitorId" , "visitorId")] %>% group_by(guideId) %>% summarize(total_views = length(guideStepId_visitorId) , Num_Steps = mean(numSteps), total_visitors = n_distinct(visitorId)) #total views per guide (including duplicates)
+
+repeatviews <- dfNU[duplicated(dfNU$guideStepId_visitorId),]
+repeatsbyguide <- repeatviews[,c("guideId", "numSteps", "guideStepId_visitorId", "visitorId")] %>% group_by(guideId) %>% summarize(repeat_views = length(guideStepId_visitorId) , distinct_repeat_views = n_distinct(guideStepId_visitorId), distinct_repeat_visitors = n_distinct(visitorId)) #stepId-visitor combinations repeating more than once - for e.g. for 3 instances of a guideStep-visitorId combo, we count only the repeats i.e. twice)
+
+dfRepeats <- merge(totalsbyguide, repeatsbyguide, by=c('guideId'))
+dfRepeats$percent_repeat_views = 100*(dfRepeats$repeat_views/dfRepeats$total_views)
+dfRepeats$percent_repeat_visitors = 100*dfRepeats$distinct_repeat_visitors/dfRepeats$total_visitors
+
+mean(dfRepeats$percent_repeat_views)
+mean(dfRepeats$percent_repeat_visitors)
+dfRepeats <- as.data.frame(dfRepeats)
+
+```
+
+
+```{r,echo=FALSE}
+#Plot of %Repeat views by guide length
+
+dfRepeats <- dfRepeats[,c("Num_Steps", "percent_repeat_views", "percent_repeat_visitors")] %>% group_by(Num_Steps) %>% summarize(percent_repeat_views_by_length = mean(percent_repeat_views), percent_repeat_visitors_by_length = mean(percent_repeat_visitors))
+
+p2 <- ggplot(dfRepeats,aes(x = Num_Steps, Rate, y = percent_repeat_views_by_length))
+   p2 + geom_line(stat = 'identity',color = "#FF4876")+
+    labs(x="Guide length (steps)", y= "% Repeat views")+
+    geom_smooth(method = "lm", se = FALSE, colour= "#0A817F")+
+    ggtitle("Plot of % repeat views by guide length")+
+    theme_hc()+
+    ylim(45,75)+
+    theme(legend.position="none")+
+    theme(plot.background = element_rect(fill = "#F6FDFC"))
+```
+
+
+```{r,echo=FALSE}
+#Plot of %Repeat visitors by guide length
+
+p3 <- ggplot(dfRepeats,aes(x = Num_Steps, Rate, y = percent_repeat_visitors_by_length))
+   p3 + geom_line(stat = 'identity',color = "#FF4876")+
+    labs(x="Guide length (steps)", y= "% Repeat visitors", na.rm = TRUE)+
+    geom_smooth(method = "lm", se = FALSE, colour= "#0A817F")+
+    ggtitle("Plot of % repeat visitors by guide length")+
+    theme_hc()+
+    theme(legend.position="none")+
+    theme(plot.background = element_rect(fill = "#F6FDFC"))
+```
+
+```{r,echo=FALSE}
+#Plot of Walkthrough completion rate (%visitors completed and %of total guides vs guide length)
+
+library(reshape2)
+library(ggplot2)
+ResAll2<- ResAll[,c("Num_Steps","perc_completion","perc_guides")]
+r <- melt(ResAll2, id.vars = 'Num_Steps')
+
+ggplot(r, aes(x=Num_Steps, y=value, fill=variable)) +
+    geom_bar(stat='identity', position='dodge')+
+    ggtitle("Walkthrough completion rate")+
+    scale_fill_manual(values = c("#FF4876", "#0A817F"), labels = c("% visitors completed", "% of total guides")) +
+    labs(x="Guide length (steps)", y= "%")+
+    guides(fill = guide_legend(title = "Legend"))+
+    theme_hc()+
+    theme(plot.background = element_rect(fill = "#F6FDFC"))
+```
+
+```{r,echo=FALSE}
+##### ONBOARDING GUIDES AND THEIR EFFECTIVENESS
+
+OBG <- read.csv("/Users/sukmanilamba/Downloads/Onboarding_guides_Pendo.csv")
+OBG$Guide_ID <- as.character(OBG$Guide_ID)
+
+dfNU_GVSC_Onb <- subset(dfNU_GVSC,Guide %in% OBG$Guide_ID)
+
+dfNU_GVSC_noseg <- subset(dfNU_GVSC,is.na(Segment))
+dfNU_GVSC_seg <- subset(dfNU_GVSC,!is.na(Segment))
+
+dfNU_GVSC_FS <- subset(dfNU_GVSC,FirstStep == 1)
+
+dfNU_GVSC_FS_seg <- subset(dfNU_GVSC_FS,!is.na(Segment))
+dfNU_GVSC_FS_noseg <- subset(dfNU_GVSC_FS,is.na(Segment))
+
+dfNU_GVSC_under7 <- subset(dfNU_GVSC,Num_Steps <= 3)
+dfNU_GVSC_7plus <- subset(dfNU_GVSC,Num_Steps > 3)
+
+dfNU_GVSC_Onb_noseg <- subset(dfNU_GVSC_Onb,is.na(Segment))
+dfNU_GVSC_Onb_seg <- subset(dfNU_GVSC_Onb,!is.na(Segment))
+
+NBuckets_Seg <- subset(NBuckets,!is.na(Segment))
+NBuckets_Noseg <- subset(NBuckets,is.na(Segment))
+```
+Looking at segmentation:
+
+Percentage of users who were not in segments and completed guides:
+```{r,echo=FALSE}
+100*(sum(dfNU_GVSC_noseg$Completed)/dim(dfNU_GVSC_noseg)[1])
+```
+
+Percentage of users who were in segments and completed guides:
+```{r,echo=FALSE}
+100*(sum(dfNU_GVSC_seg$Completed)/dim(dfNU_GVSC_seg)[1])
+```
+
+Percentage of visitors overall who completed guides:
+```{r,echo=FALSE}
+100*(sum(dfNU_GVSC$Completed)/dim(dfNU_GVSC)[1])
+```
+Percentage of visitors overall who completed guides (conditional on completing the first step):
+```{r,echo=FALSE}
+100*(sum(dfNU_GVSC_FS$Completed)/dim(dfNU_GVSC_FS)[1])
+```
+
+Percentage of visitors who completed all except the final step and were not in segments:
+```{r,echo=FALSE}
+100*(sum(dfNU_GVSC_noseg$CompletedButOne)/dim(dfNU_GVSC_noseg)[1])
+```
+
+Percentage of visitors who completed all except the final step and were in segments:
+```{r,echo=FALSE}
+100*(sum(dfNU_GVSC_seg$CompletedButOne)/dim(dfNU_GVSC_seg)[1])
+```
+
+Percentage of visitors overall who completed all except the final step:
+```{r,echo=FALSE}
+100*(sum(dfNU_GVSC$CompletedButOne)/dim(dfNU_GVSC)[1])
+```
+
+Percentage of visitors overall who completed all except the final step (conditional on finishing the first step):
+```{r,echo=FALSE}
+100*(sum(dfNU_GVSC_FS$CompletedButOne)/dim(dfNU_GVSC_FS)[1])
+```
+
+Onboarding Guides:
+
+```{r,echo=FALSE}
+##### ONBOARDING GUIDES AND THEIR EFFECTIVENESS
+
+OBG <- read.csv("/Users/sukmanilamba/Downloads/Onboarding_guides_Pendo.csv")
+OBG$Guide_ID <- as.character(OBG$Guide_ID)
+
+dfNU_GVSC_Onb <- subset(dfNU_GVSC,Guide %in% OBG$Guide_ID)
+
+dfNU_GVSC_Onb_noseg <- subset(dfNU_GVSC_Onb,is.na(Segment))
+dfNU_GVSC_Onb_seg <- subset(dfNU_GVSC_Onb,!is.na(Segment))
+
+dfNU_GVSC_noseg <- subset(dfNU_GVSC,is.na(Segment))
+dfNU_GVSC_seg <- subset(dfNU_GVSC,!is.na(Segment))
+
+dfNU_GVSC_FS <- subset(dfNU_GVSC,FirstStep == 1)
+
+dfNU_GVSC_FS_seg <- subset(dfNU_GVSC_FS,!is.na(Segment))
+dfNU_GVSC_FS_noseg <- subset(dfNU_GVSC_FS,is.na(Segment))
+
+dfNU_GVSC_under7 <- subset(dfNU_GVSC,Num_Steps <= 3)
+dfNU_GVSC_7plus <- subset(dfNU_GVSC,Num_Steps > 3)
+
+NBuckets_Seg <- subset(NBuckets,!is.na(Segment))
+NBuckets_Noseg <- subset(NBuckets,is.na(Segment))
+
+# This is the percentage of users who completed the first walk through 
+# For each guide Id
+# Get the users who completed all steps
+# % of those who completed/all users
+# % of those who completed/those who got to first step
+# % of those who completed/those who got to first two steps .... 
+```
+
+
+
+
+
+
+
+
+
+
